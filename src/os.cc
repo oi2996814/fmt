@@ -12,43 +12,51 @@
 
 #include "fmt/os.h"
 
-#include <climits>
+#ifndef FMT_MODULE
+#  include <climits>
 
-#if FMT_USE_FCNTL
-#  include <sys/stat.h>
-#  include <sys/types.h>
+#  if FMT_USE_FCNTL
+#    include <sys/stat.h>
+#    include <sys/types.h>
 
-#  ifndef _WIN32
-#    include <unistd.h>
-#  else
-#    ifndef WIN32_LEAN_AND_MEAN
-#      define WIN32_LEAN_AND_MEAN
+#    ifdef _WRS_KERNEL    // VxWorks7 kernel
+#      include <ioLib.h>  // getpagesize
 #    endif
-#    include <io.h>
 
-#    ifndef S_IRUSR
-#      define S_IRUSR _S_IREAD
-#    endif
-#    ifndef S_IWUSR
-#      define S_IWUSR _S_IWRITE
-#    endif
-#    ifndef S_IRGRP
-#      define S_IRGRP 0
-#    endif
-#    ifndef S_IWGRP
-#      define S_IWGRP 0
-#    endif
-#    ifndef S_IROTH
-#      define S_IROTH 0
-#    endif
-#    ifndef S_IWOTH
-#      define S_IWOTH 0
-#    endif
-#  endif  // _WIN32
-#endif    // FMT_USE_FCNTL
+#    ifndef _WIN32
+#      include <unistd.h>
+#    else
+#      ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#      endif
+#      include <io.h>
+#    endif  // _WIN32
+#  endif    // FMT_USE_FCNTL
+
+#  ifdef _WIN32
+#    include <windows.h>
+#  endif
+#endif
 
 #ifdef _WIN32
-#  include <windows.h>
+#  ifndef S_IRUSR
+#    define S_IRUSR _S_IREAD
+#  endif
+#  ifndef S_IWUSR
+#    define S_IWUSR _S_IWRITE
+#  endif
+#  ifndef S_IRGRP
+#    define S_IRGRP 0
+#  endif
+#  ifndef S_IWGRP
+#    define S_IWGRP 0
+#  endif
+#  ifndef S_IROTH
+#    define S_IROTH 0
+#  endif
+#  ifndef S_IWOTH
+#    define S_IWOTH 0
+#  endif
 #endif
 
 namespace {
@@ -72,34 +80,6 @@ inline std::size_t convert_rwcount(std::size_t count) { return count; }
 FMT_BEGIN_NAMESPACE
 
 #ifdef _WIN32
-detail::utf16_to_utf8::utf16_to_utf8(basic_string_view<wchar_t> s) {
-  if (int error_code = convert(s)) {
-    FMT_THROW(windows_error(error_code,
-                            "cannot convert string from UTF-16 to UTF-8"));
-  }
-}
-
-int detail::utf16_to_utf8::convert(basic_string_view<wchar_t> s) {
-  if (s.size() > INT_MAX) return ERROR_INVALID_PARAMETER;
-  int s_size = static_cast<int>(s.size());
-  if (s_size == 0) {
-    // WideCharToMultiByte does not support zero length, handle separately.
-    buffer_.resize(1);
-    buffer_[0] = 0;
-    return 0;
-  }
-
-  int length = WideCharToMultiByte(CP_UTF8, 0, s.data(), s_size, nullptr, 0,
-                                   nullptr, nullptr);
-  if (length == 0) return GetLastError();
-  buffer_.resize(length + 1);
-  length = WideCharToMultiByte(CP_UTF8, 0, s.data(), s_size, &buffer_[0],
-                               length, nullptr, nullptr);
-  if (length == 0) return GetLastError();
-  buffer_[length] = 0;
-  return 0;
-}
-
 namespace detail {
 
 class system_message {
@@ -138,10 +118,10 @@ class utf8_system_category final : public std::error_category {
  public:
   const char* name() const noexcept override { return "system"; }
   std::string message(int error_code) const override {
-    system_message msg(error_code);
+    auto&& msg = system_message(error_code);
     if (msg) {
-      utf16_to_utf8 utf8_message;
-      if (utf8_message.convert(msg) == ERROR_SUCCESS) {
+      auto utf8_message = to_utf8<wchar_t>();
+      if (utf8_message.convert(msg)) {
         return utf8_message.str();
       }
     }
@@ -165,12 +145,12 @@ std::system_error vwindows_error(int err_code, string_view format_str,
 void detail::format_windows_error(detail::buffer<char>& out, int error_code,
                                   const char* message) noexcept {
   FMT_TRY {
-    system_message msg(error_code);
+    auto&& msg = system_message(error_code);
     if (msg) {
-      utf16_to_utf8 utf8_message;
-      if (utf8_message.convert(msg) == ERROR_SUCCESS) {
-        fmt::format_to(buffer_appender<char>(out), "{}: {}", message,
-                       utf8_message);
+      auto utf8_message = to_utf8<wchar_t>();
+      if (utf8_message.convert(msg)) {
+        fmt::format_to(appender(out), FMT_STRING("{}: {}"), message,
+                       string_view(utf8_message));
         return;
       }
     }
@@ -180,7 +160,7 @@ void detail::format_windows_error(detail::buffer<char>& out, int error_code,
 }
 
 void report_windows_error(int error_code, const char* message) noexcept {
-  report_error(detail::format_windows_error, error_code, message);
+  do_report_error(detail::format_windows_error, error_code, message);
 }
 #endif  // _WIN32
 
@@ -206,28 +186,41 @@ void buffered_file::close() {
 }
 
 int buffered_file::descriptor() const {
+#ifdef FMT_HAS_SYSTEM
+  // fileno is a macro on OpenBSD.
+#  ifdef fileno
+#    undef fileno
+#  endif
   int fd = FMT_POSIX_CALL(fileno(file_));
+#elif defined(_WIN32)
+  int fd = _fileno(file_);
+#else
+  int fd = fileno(file_);
+#endif
   if (fd == -1)
     FMT_THROW(system_error(errno, FMT_STRING("cannot get file descriptor")));
   return fd;
 }
 
 #if FMT_USE_FCNTL
-file::file(cstring_view path, int oflag) {
 #  ifdef _WIN32
-  using mode_t = int;
+using mode_t = int;
 #  endif
-  constexpr mode_t mode =
-      S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+
+constexpr mode_t default_open_mode =
+    S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+
+file::file(cstring_view path, int oflag) {
 #  if defined(_WIN32) && !defined(__MINGW32__)
   fd_ = -1;
-  FMT_POSIX_CALL(sopen_s(&fd_, path.c_str(), oflag, _SH_DENYNO, mode));
+  auto converted = detail::utf8_to_utf16(string_view(path.c_str()));
+  *this = file::open_windows_file(converted.c_str(), oflag);
 #  else
-  FMT_RETRY(fd_, FMT_POSIX_CALL(open(path.c_str(), oflag, mode)));
-#  endif
+  FMT_RETRY(fd_, FMT_POSIX_CALL(open(path.c_str(), oflag, default_open_mode)));
   if (fd_ == -1)
     FMT_THROW(
         system_error(errno, FMT_STRING("cannot open file {}"), path.c_str()));
+#  endif
 }
 
 file::~file() noexcept {
@@ -315,11 +308,35 @@ void file::dup2(int fd, std::error_code& ec) noexcept {
   if (result == -1) ec = std::error_code(errno, std::generic_category());
 }
 
-void file::pipe(file& read_end, file& write_end) {
-  // Close the descriptors first to make sure that assignments don't throw
-  // and there are no leaks.
-  read_end.close();
-  write_end.close();
+buffered_file file::fdopen(const char* mode) {
+// Don't retry as fdopen doesn't return EINTR.
+#  if defined(__MINGW32__) && defined(_POSIX_)
+  FILE* f = ::fdopen(fd_, mode);
+#  else
+  FILE* f = FMT_POSIX_CALL(fdopen(fd_, mode));
+#  endif
+  if (!f) {
+    FMT_THROW(system_error(
+        errno, FMT_STRING("cannot associate stream with file descriptor")));
+  }
+  buffered_file bf(f);
+  fd_ = -1;
+  return bf;
+}
+
+#  if defined(_WIN32) && !defined(__MINGW32__)
+file file::open_windows_file(wcstring_view path, int oflag) {
+  int fd = -1;
+  auto err = _wsopen_s(&fd, path.c_str(), oflag, _SH_DENYNO, default_open_mode);
+  if (fd == -1) {
+    FMT_THROW(system_error(err, FMT_STRING("cannot open file {}"),
+                           detail::to_utf8<wchar_t>(path.c_str()).c_str()));
+  }
+  return file(fd);
+}
+#  endif
+
+pipe::pipe() {
   int fds[2] = {};
 #  ifdef _WIN32
   // Make the default pipe capacity same as on Linux 2.6.11+.
@@ -332,42 +349,50 @@ void file::pipe(file& read_end, file& write_end) {
 #  endif
   if (result != 0)
     FMT_THROW(system_error(errno, FMT_STRING("cannot create pipe")));
-  // The following assignments don't throw because read_fd and write_fd
-  // are closed.
+  // The following assignments don't throw.
   read_end = file(fds[0]);
   write_end = file(fds[1]);
 }
 
-buffered_file file::fdopen(const char* mode) {
-// Don't retry as fdopen doesn't return EINTR.
-#  if defined(__MINGW32__) && defined(_POSIX_)
-  FILE* f = ::fdopen(fd_, mode);
-#  else
-  FILE* f = FMT_POSIX_CALL(fdopen(fd_, mode));
-#  endif
-  if (!f)
-    FMT_THROW(system_error(
-        errno, FMT_STRING("cannot associate stream with file descriptor")));
-  buffered_file bf(f);
-  fd_ = -1;
-  return bf;
-}
-
+#  if !defined(__MSDOS__)
 long getpagesize() {
-#  ifdef _WIN32
+#    ifdef _WIN32
   SYSTEM_INFO si;
   GetSystemInfo(&si);
   return si.dwPageSize;
-#  else
+#    else
+#      ifdef _WRS_KERNEL
+  long size = FMT_POSIX_CALL(getpagesize());
+#      else
   long size = FMT_POSIX_CALL(sysconf(_SC_PAGESIZE));
+#      endif
+
   if (size < 0)
     FMT_THROW(system_error(errno, FMT_STRING("cannot get memory page size")));
   return size;
+#    endif
+}
 #  endif
+
+void ostream::grow(buffer<char>& buf, size_t) {
+  if (buf.size() == buf.capacity()) static_cast<ostream&>(buf).flush();
 }
 
-FMT_API void ostream::grow(size_t) {
-  if (this->size() == this->capacity()) flush();
+ostream::ostream(cstring_view path, const detail::ostream_params& params)
+    : buffer<char>(grow), file_(path, params.oflag) {
+  set(new char[params.buffer_size], params.buffer_size);
+}
+
+ostream::ostream(ostream&& other) noexcept
+    : buffer<char>(grow, other.data(), other.size(), other.capacity()),
+      file_(std::move(other.file_)) {
+  other.clear();
+  other.set(nullptr, 0);
+}
+
+ostream::~ostream() {
+  flush();
+  delete[] data();
 }
 #endif  // FMT_USE_FCNTL
 FMT_END_NAMESPACE
